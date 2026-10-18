@@ -32,6 +32,45 @@ is_media_file() {
     echo "$ext" | grep -qE "$MEDIA_EXT_REGEX"
 }
 
+# Expand shell-style environment variables in a watch_dirs.txt entry without
+# using eval (which would execute command substitutions or other shell syntax).
+# Supports $VAR, ${VAR}, ~, and ~/... while leaving unknown variables literal.
+expand_watch_path() {
+    local remaining="$1"
+    local expanded=""
+    local token name value
+
+    case "$remaining" in
+        "~") remaining="$HOME" ;;
+        "~/"*) remaining="$HOME/${remaining#\~/}" ;;
+    esac
+
+    while [ -n "$remaining" ]; do
+        if [[ "$remaining" =~ ^\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}(.*)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            token="\${${name}}"
+            remaining="${BASH_REMATCH[2]}"
+        elif [[ "$remaining" =~ ^\$([a-zA-Z_][a-zA-Z0-9_]*)(.*)$ ]]; then
+            token="\$${BASH_REMATCH[1]}"
+            name="${BASH_REMATCH[1]}"
+            remaining="${BASH_REMATCH[2]}"
+        else
+            expanded="${expanded}${remaining:0:1}"
+            remaining="${remaining:1}"
+            continue
+        fi
+
+        if printenv "$name" >/dev/null 2>&1; then
+            value="$(printenv "$name")"
+            expanded="${expanded}${value}"
+        else
+            expanded="${expanded}${token}"
+        fi
+    done
+
+    printf '%s\n' "$expanded"
+}
+
 # ---------------------------------------------------------------------
 # CRYPTOGRAPHIC HASH & BINARY INTEGRITY (BUG-05, SEC-02)
 # ---------------------------------------------------------------------
@@ -1064,6 +1103,7 @@ do_watch() {
             line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             [ -z "$line" ] && continue
             case "$line" in \#*) continue ;; esac
+            line="$(expand_watch_path "$line")"
             if [ -d "$line" ]; then
                 watch_dirs+=("$(cd "$line" && pwd)")
             fi
@@ -1079,14 +1119,14 @@ do_watch() {
 
     # Deduplicate watched folders
     local unique_dirs=()
-    for d in "${watch_dirs[@]}"; do
+    for d in "${watch_dirs[@]+"${watch_dirs[@]}"}"; do
         local seen=0
-        for u in "${unique_dirs[@]}"; do
+        for u in "${unique_dirs[@]+"${unique_dirs[@]}"}"; do
             [ "$u" = "$d" ] && seen=1 && break
         done
         [ $seen -eq 0 ] && unique_dirs+=("$d")
     done
-    watch_dirs=("${unique_dirs[@]}")
+    watch_dirs=("${unique_dirs[@]+"${unique_dirs[@]}"}")
 
     if [ ${#watch_dirs[@]} -eq 0 ]; then
         mkdir -p "$HOME/Pictures"
@@ -1100,10 +1140,13 @@ do_watch() {
     echo -e "${GRAY}  Database: $DB${NC}"
     echo -e "${CYAN}==========================================================${NC}"
     echo "  Watched Folders:"
-    for d in "${watch_dirs[@]}"; do
+    for d in "${watch_dirs[@]+"${watch_dirs[@]}"}"; do
         echo "    -> $d"
     done
     echo -e "${CYAN}==========================================================${NC}"
+
+    # Give users a moment to review the startup summary before backup begins.
+    sleep 3
 
     # Phase 1: Startup Scan
     echo -e "${CYAN}[Phase 1] Scanning for unrecorded files...${NC}"
@@ -1119,7 +1162,7 @@ do_watch() {
                 invoke_upload "$file"
             fi
         fi
-    done < <(find "${watch_dirs[@]}" -type f -print0 2>/dev/null)
+    done < <(find "${watch_dirs[@]+"${watch_dirs[@]}"}" -type f -print0 2>/dev/null)
 
     # Flush any pending files from retry queue
     flush_retry_queue
@@ -1138,7 +1181,7 @@ do_watch() {
         echo -e "${YELLOW}[Phase 2] Real-time watcher active (fswatch).${NC}"
         echo "  Waiting for new media... Press Ctrl+C to stop."
 
-        fswatch -r -e "/\\." "${watch_dirs[@]}" 2>/dev/null | while IFS= read -r new_path; do
+        fswatch -r -e "/\\." "${watch_dirs[@]+"${watch_dirs[@]}"}" 2>/dev/null | while IFS= read -r new_path; do
             invoke_upload "$new_path"
         done &
         watcher_pid=$!
@@ -1147,7 +1190,7 @@ do_watch() {
         echo -e "${YELLOW}[Phase 2] Real-time watcher active (inotifywait).${NC}"
         echo "  Waiting for new media... Press Ctrl+C to stop."
 
-        inotifywait -m -r -e close_write,moved_to,create --format '%w%f' "${watch_dirs[@]}" 2>/dev/null | while IFS= read -r new_path; do
+        inotifywait -m -r -e close_write,moved_to,create --format '%w%f' "${watch_dirs[@]+"${watch_dirs[@]}"}" 2>/dev/null | while IFS= read -r new_path; do
             invoke_upload "$new_path"
         done &
         watcher_pid=$!
@@ -1195,7 +1238,7 @@ do_watch() {
                         invoke_upload "$file"
                     fi
                 fi
-            done < <(find "${watch_dirs[@]}" -type f -print0 2>/dev/null)
+            done < <(find "${watch_dirs[@]+"${watch_dirs[@]}"}" -type f -print0 2>/dev/null)
         fi
     done
 }
@@ -1304,7 +1347,8 @@ show_help() {
 # ---------------------------------------------------------------------
 # CLI DISPATCHER
 # ---------------------------------------------------------------------
-CMD="${1:-}"
+main() {
+local CMD="${1:-}"
 case "$CMD" in
     watch|--watch|run|--run)
         shift || true
@@ -1355,3 +1399,8 @@ case "$CMD" in
         exit 1
         ;;
 esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

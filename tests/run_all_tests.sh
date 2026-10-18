@@ -12,6 +12,7 @@ TEST_FILES=(
     "test_permissions.sh"
     "test_process_stop.sh"
     "test_upload_verification.sh"
+    "test_watch_paths.sh"
 )
 
 TOTAL_PASSED=0

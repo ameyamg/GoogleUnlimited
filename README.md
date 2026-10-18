@@ -332,9 +332,13 @@ When a `watch_dirs.txt` file exists in the repository root, the watcher switches
    E:\Sony_A7_Media
 
    # macOS / Linux paths
-   # /Volumes/ExternalSSD/Photos
-   # /home/username/Media
+   $HOME/Google Photos
+   ${HOME}/Media
+   ~/Pictures
+   /Volumes/ExternalSSD/Photos
    ```
+   On macOS and Linux, `$VAR`, `${VAR}`, and a leading `~` are expanded. Unknown
+   variables are left unchanged, and shell expressions are never executed.
 3. You can also specify directories ad-hoc when launching:
    ```cmd
    GoogleUnlimited.bat watch "D:\Photos" "E:\Videos"

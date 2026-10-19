@@ -23,8 +23,8 @@ jobs:
 
       - name: ShellCheck Bash Scripts
         run: |
-          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317,SC2120,SC2119 google-unlimited.sh
-          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317,SC2120,SC2119 tests/*.sh
+          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317,SC2120,SC2119,SC2088 google-unlimited.sh
+          shellcheck --severity=warning -e SC2034,SC2086,SC2181,SC2016,SC2015,SC2317,SC2120,SC2119,SC2088 tests/*.sh
 
       - name: Bash Syntax Validation (bash -n)
         run: |
@@ -97,6 +97,7 @@ jobs:
           ./tests/test_creds.sh
           ./tests/test_dedup.sh
           ./tests/test_permissions.sh
+          ./tests/test_watch_paths.sh
 
       - name: Validate LaunchAgent Plist Configuration (REL-01)
         run: |

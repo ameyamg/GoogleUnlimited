@@ -40,9 +40,10 @@ expand_watch_path() {
     local expanded=""
     local token name value
 
+    # shellcheck disable=SC2088
     case "$remaining" in
-        "~") remaining="$HOME" ;;
-        "~/"*) remaining="$HOME/${remaining#\~/}" ;;
+        \~) remaining="$HOME" ;;
+        \~/*) remaining="$HOME/${remaining#\~/}" ;;
     esac
 
     while [ -n "$remaining" ]; do

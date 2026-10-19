@@ -91,6 +91,10 @@ compute_content_hash() {
     fi
 }
 
+escape_sqlite_literal() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
 get_trusted_checksum() {
     local bname="$1"
     # Official trusted SHA-256 checksums from gotohp v0.11.0 release
@@ -285,8 +289,10 @@ write_log() {
     local level="${2:-INFO}"
     local ts
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    local escaped_msg="${msg//\'/\'\'}"
-    local escaped_level="${level//\'/\'\'}"
+    local escaped_msg
+    escaped_msg="$(escape_sqlite_literal "$msg")"
+    local escaped_level
+    escaped_level="$(escape_sqlite_literal "$level")"
     sqlite3 "$DB" <<EOF 2>/dev/null || true
 INSERT INTO logs(level, message) VALUES ('$escaped_level', '$escaped_msg');
 EOF
@@ -297,8 +303,10 @@ is_uploaded() {
     local fpath="$1"
     local fname="${2:-$(basename "$fpath")}"
     local fsize="${3:-0}"
-    local escaped_path="${fpath//\'/\'\'}"
-    local escaped_name="${fname//\'/\'\'}"
+    local escaped_path
+    escaped_path="$(escape_sqlite_literal "$fpath")"
+    local escaped_name
+    escaped_name="$(escape_sqlite_literal "$fname")"
 
     # Ensure fsize is numeric to prevent SQL injection
     if ! [[ "$fsize" =~ ^[0-9]+$ ]]; then
@@ -373,12 +381,16 @@ save_upload() {
     local mkey="$2"
     local fname="${3:-$(basename "$fpath")}"
     local fsize="${4:-0}"
-    local escaped_path="${fpath//\'/\'\'}"
-    local escaped_mkey="${mkey//\'/\'\'}"
-    local escaped_name="${fname//\'/\'\'}"
+    local escaped_path
+    escaped_path="$(escape_sqlite_literal "$fpath")"
+    local escaped_mkey
+    escaped_mkey="$(escape_sqlite_literal "$mkey")"
+    local escaped_name
+    escaped_name="$(escape_sqlite_literal "$fname")"
     local chash
     chash="$(compute_content_hash "$fpath")"
-    local escaped_hash="${chash//\'/\'\'}"
+    local escaped_hash
+    escaped_hash="$(escape_sqlite_literal "$chash")"
 
     if ! [[ "$fsize" =~ ^[0-9]+$ ]]; then
         fsize=0
@@ -393,7 +405,8 @@ EOF
 save_retry() {
     local fpath="$1"
     local attempts="${2:-0}"
-    local escaped_path="${fpath//\'/\'\'}"
+    local escaped_path
+    escaped_path="$(escape_sqlite_literal "$fpath")"
     if ! [[ "$attempts" =~ ^[0-9]+$ ]]; then
         attempts=0
     fi
@@ -404,7 +417,8 @@ EOF
 
 remove_retry() {
     local fpath="$1"
-    local escaped_path="${fpath//\'/\'\'}"
+    local escaped_path
+    escaped_path="$(escape_sqlite_literal "$fpath")"
     sqlite3 "$DB" <<EOF 2>/dev/null || true
 DELETE FROM retry_queue WHERE path = '$escaped_path';
 EOF
@@ -1005,7 +1019,8 @@ invoke_upload() {
 
     wait_for_file_ready "$fpath"
     local status=$?
-    local escaped_path="${fpath//\'/\'\'}"
+    local escaped_path
+    escaped_path="$(escape_sqlite_literal "$fpath")"
 
     if [ $status -eq 2 ]; then
         remove_retry "$fpath"

@@ -4,6 +4,8 @@
 *.db-shm
 gphotos.db
 watch_dirs.txt
+skill-first-workflow.md
+gemini.md
 
 # Authentication Credentials & Tokens (DO NOT COMMIT)
 gotohp.config

@@ -212,6 +212,10 @@ run_gotohp() {
         echo "Please run: ./google-unlimited.sh setup" >&2
         exit 1
     fi
+    if ! verify_binary "$bin" >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR] Binary integrity verification failed for $bin. Aborting execution.${NC}" >&2
+        exit 1
+    fi
     local cmd=("$bin")
     if [ -f "$SCRIPT_DIR/gotohp.config" ]; then
         cmd+=("--config" "$SCRIPT_DIR/gotohp.config")
@@ -283,7 +287,9 @@ write_log() {
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     local escaped_msg="${msg//\'/\'\'}"
     local escaped_level="${level//\'/\'\'}"
-    sqlite3 "$DB" "INSERT INTO logs(level, message) VALUES ('$escaped_level', '$escaped_msg');" 2>/dev/null || true
+    sqlite3 "$DB" <<EOF 2>/dev/null || true
+INSERT INTO logs(level, message) VALUES ('$escaped_level', '$escaped_msg');
+EOF
     echo "[$ts][$level] $msg"
 }
 
@@ -301,7 +307,10 @@ is_uploaded() {
 
     # 1. Exact path match: verify file size and hash haven't changed since previous upload
     local exact_row
-    exact_row=$(sqlite3 "$DB" "SELECT file_size || '|' || COALESCE(content_hash, '') FROM uploads WHERE path = '$escaped_path' LIMIT 1;" 2>/dev/null || true)
+    exact_row=$(sqlite3 "$DB" <<EOF 2>/dev/null || true
+SELECT file_size || '|' || COALESCE(content_hash, '') FROM uploads WHERE path = '$escaped_path' LIMIT 1;
+EOF
+)
     if [ -n "$exact_row" ]; then
         local prev_size="${exact_row%%|*}"
         local prev_hash="${exact_row#*|}"
@@ -321,21 +330,32 @@ is_uploaded() {
     # 2. Dual-boot cross-platform deduplication check with content hash verification (BUG-05)
     if [ "$fsize" -gt 0 ]; then
         local match_row
-        match_row=$(sqlite3 "$DB" "SELECT content_hash FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND file_size > 0 LIMIT 1;" 2>/dev/null || true)
+        match_row=$(sqlite3 "$DB" <<EOF 2>/dev/null || true
+SELECT content_hash FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND file_size > 0 LIMIT 1;
+EOF
+)
         if [ -n "$match_row" ]; then
             local current_hash
             current_hash="$(compute_content_hash "$fpath")"
             if [ -n "$current_hash" ]; then
                 local hash_match
-                hash_match=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND content_hash = '$current_hash';" 2>/dev/null || echo 0)
+                hash_match=$(sqlite3 "$DB" <<EOF 2>/dev/null || echo 0
+SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND content_hash = '$current_hash';
+EOF
+)
                 if [ -n "$hash_match" ] && [ "$hash_match" -gt 0 ]; then
                     return 0
                 fi
                 # Check for legacy entry without content_hash
                 local legacy_match
-                legacy_match=$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');" 2>/dev/null || echo 0)
+                legacy_match=$(sqlite3 "$DB" <<EOF 2>/dev/null || echo 0
+SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');
+EOF
+)
                 if [ -n "$legacy_match" ] && [ "$legacy_match" -gt 0 ]; then
-                    sqlite3 "$DB" "UPDATE uploads SET content_hash = '$current_hash' WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');" 2>/dev/null || true
+                    sqlite3 "$DB" <<EOF 2>/dev/null || true
+UPDATE uploads SET content_hash = '$current_hash' WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');
+EOF
                     return 0
                 fi
                 return 1
@@ -377,13 +397,17 @@ save_retry() {
     if ! [[ "$attempts" =~ ^[0-9]+$ ]]; then
         attempts=0
     fi
-    sqlite3 "$DB" "INSERT OR REPLACE INTO retry_queue(path, attempts, last_attempt) VALUES ('$escaped_path', $attempts, datetime('now','localtime'));" 2>/dev/null || true
+    sqlite3 "$DB" <<EOF 2>/dev/null || true
+INSERT OR REPLACE INTO retry_queue(path, attempts, last_attempt) VALUES ('$escaped_path', $attempts, datetime('now','localtime'));
+EOF
 }
 
 remove_retry() {
     local fpath="$1"
     local escaped_path="${fpath//\'/\'\'}"
-    sqlite3 "$DB" "DELETE FROM retry_queue WHERE path = '$escaped_path';" 2>/dev/null || true
+    sqlite3 "$DB" <<EOF 2>/dev/null || true
+DELETE FROM retry_queue WHERE path = '$escaped_path';
+EOF
 }
 
 flush_retry_queue() {
@@ -951,6 +975,8 @@ wait_for_file_ready() {
 invoke_upload() {
     local fpath="$1"
     [ -d "$fpath" ] && return
+    # Security: Skip symbolic links to prevent arbitrary file traversal
+    [ -L "$fpath" ] && return
     [ ! -f "$fpath" ] && return
     case "$fpath" in
         */Modules/*) return ;;
@@ -986,7 +1012,10 @@ invoke_upload() {
         return
     elif [ $status -eq 1 ]; then
         local prev
-        prev=$(sqlite3 "$DB" "SELECT attempts FROM retry_queue WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
+        prev=$(sqlite3 "$DB" <<EOF 2>/dev/null || echo 0
+SELECT attempts FROM retry_queue WHERE path = '$escaped_path';
+EOF
+)
         [ -z "$prev" ] && prev=0
         write_log "File still downloading/locked ($fname) - remaining in queue." "WARN"
         save_retry "$fpath" "$prev"
@@ -1025,7 +1054,10 @@ invoke_upload() {
         [ -n "$err_msg" ] && err_suffix=" ($err_msg)"
 
         local attempts
-        attempts=$(sqlite3 "$DB" "SELECT attempts FROM retry_queue WHERE path = '$escaped_path';" 2>/dev/null || echo 0)
+        attempts=$(sqlite3 "$DB" <<EOF 2>/dev/null || echo 0
+SELECT attempts FROM retry_queue WHERE path = '$escaped_path';
+EOF
+)
         [ -z "$attempts" ] && attempts=0
         attempts=$((attempts + 1))
         if [ "$attempts" -ge 3 ]; then

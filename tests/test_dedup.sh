@@ -50,7 +50,10 @@ test_is_uploaded() {
 
     # 1. Exact path (with in-place modification verification)
     local exact_row
-    exact_row=$(sqlite3 "$TEST_DB" "SELECT file_size || '|' || COALESCE(content_hash, '') FROM uploads WHERE path = '$escaped_path' LIMIT 1;" 2>/dev/null || true)
+    exact_row=$(sqlite3 "$TEST_DB" <<EOF 2>/dev/null || true
+SELECT file_size || '|' || COALESCE(content_hash, '') FROM uploads WHERE path = '$escaped_path' LIMIT 1;
+EOF
+)
     if [ -n "$exact_row" ]; then
         local prev_size="${exact_row%%|*}"
         local prev_hash="${exact_row#*|}"
@@ -70,18 +73,27 @@ test_is_uploaded() {
     # 2. Check candidate hash against records with matching name and size
     if [ "$fsize" -gt 0 ]; then
         local match_row
-        match_row=$(sqlite3 "$TEST_DB" "SELECT content_hash FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize LIMIT 1;" 2>/dev/null || true)
+        match_row=$(sqlite3 "$TEST_DB" <<EOF 2>/dev/null || true
+SELECT content_hash FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize LIMIT 1;
+EOF
+)
         if [ -n "$match_row" ]; then
             local current_hash
             current_hash="$(compute_hash "$fpath")"
             local hash_match
-            hash_match=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND content_hash = '$current_hash';" 2>/dev/null || echo 0)
+            hash_match=$(sqlite3 "$TEST_DB" <<EOF 2>/dev/null || echo 0
+SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND content_hash = '$current_hash';
+EOF
+)
             if [ "$hash_match" -gt 0 ]; then
                 return 0
             fi
             # Legacy entry without content_hash
             local legacy_match
-            legacy_match=$(sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');" 2>/dev/null || echo 0)
+            legacy_match=$(sqlite3 "$TEST_DB" <<EOF 2>/dev/null || echo 0
+SELECT COUNT(*) FROM uploads WHERE file_name = '$escaped_name' AND file_size = $fsize AND (content_hash IS NULL OR content_hash = '');
+EOF
+)
             if [ "$legacy_match" -gt 0 ]; then
                 return 0
             fi
@@ -114,8 +126,10 @@ mkdir -p "$TEMP_DIR/FolderA"
 head -c 1024 < /dev/zero | tr '\0' 'A' > "$FILE_A"
 HASH_A="$(compute_hash "$FILE_A")"
 
-# Insert File A into test DB
-sqlite3 "$TEST_DB" "INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('$FILE_A', 'KEY_A', 'photo.jpg', 1024, '$HASH_A');"
+# Insert File A into test DB via heredoc
+sqlite3 "$TEST_DB" <<EOF
+INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('${FILE_A//\'/\'\'}', 'KEY_A', 'photo.jpg', 1024, '$HASH_A');
+EOF
 
 # 1. Exact path
 test_is_uploaded "$FILE_A" && res1=0 || res1=$?
@@ -149,6 +163,34 @@ assert_result "Modified file with same size but different content on same path r
 head -c 1024 < /dev/zero | tr '\0' 'A' > "$FILE_A"
 test_is_uploaded "$FILE_A" && res6=0 || res6=$?
 assert_result "Restored file with original content on same path returns 0 (duplicate)" "$res6" 0
+
+# 7. File with double quotes in filename: vacation"photo.jpg (Finding 6)
+FILE_QUOTE="$TEMP_DIR/FolderD/vacation\"photo.jpg"
+mkdir -p "$TEMP_DIR/FolderD"
+head -c 512 < /dev/zero | tr '\0' 'Q' > "$FILE_QUOTE"
+HASH_QUOTE="$(compute_hash "$FILE_QUOTE")"
+escaped_quote_path="${FILE_QUOTE//\'/\'\'}"
+escaped_quote_name="$(basename "$FILE_QUOTE")"
+escaped_quote_name="${escaped_quote_name//\'/\'\'}"
+sqlite3 "$TEST_DB" <<EOF
+INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('$escaped_quote_path', 'KEY_Q', '$escaped_quote_name', 512, '$HASH_QUOTE');
+EOF
+test_is_uploaded "$FILE_QUOTE" && res7=0 || res7=$?
+assert_result "File with double quote in name queries safely via heredoc (duplicate)" "$res7" 0
+
+# 8. File with single quote in filename: mom's_photo.jpg (Finding 6)
+FILE_APOS="$TEMP_DIR/FolderE/mom's_photo.jpg"
+mkdir -p "$TEMP_DIR/FolderE"
+head -c 512 < /dev/zero | tr '\0' 'S' > "$FILE_APOS"
+HASH_APOS="$(compute_hash "$FILE_APOS")"
+escaped_apos_path="${FILE_APOS//\'/\'\'}"
+escaped_apos_name="$(basename "$FILE_APOS")"
+escaped_apos_name="${escaped_apos_name//\'/\'\'}"
+sqlite3 "$TEST_DB" <<EOF
+INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('$escaped_apos_path', 'KEY_S', '$escaped_apos_name', 512, '$HASH_APOS');
+EOF
+test_is_uploaded "$FILE_APOS" && res8=0 || res8=$?
+assert_result "File with single quote in name queries safely via heredoc (duplicate)" "$res8" 0
 
 echo "=========================================================="
 echo "  RESULTS: $PASSED Passed, $FAILED Failed"

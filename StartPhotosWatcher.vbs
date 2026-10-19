@@ -1,6 +1,9 @@
 ' =====================================================================
-' Portable Silent Launcher for WatchAndUpload.ps1
+' Portable Silent Launcher for WatchAndUpload.ps1 (Legacy Fallback)
 ' Automatically discovers script path and launches hidden in background
+' NOTE: In modern Windows environments with Attack Surface Reduction (ASR)
+' rules enabled, invoke GoogleUnlimited.bat silent or PowerShell Start-Process
+' directly to launch without triggering script-host security policies.
 ' =====================================================================
 Set WshShell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")

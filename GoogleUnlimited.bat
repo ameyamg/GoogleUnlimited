@@ -139,7 +139,7 @@ exit /b 0
 
 :do_launch_silent
 echo Launching Google Photos watcher in silent background mode...
-wscript.exe "%~dp0StartPhotosWatcher.vbs"
+%PS_CMD% -Command "Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""%~dp0WatchAndUpload.ps1""' -WindowStyle Hidden"
 echo [OK] Background watcher launched.
 if "%IS_MENU%"=="1" timeout /t 3 >nul 2>&1
 if "%IS_MENU%"=="1" goto menu
@@ -209,8 +209,16 @@ goto manage_account
 echo.
 set "acemail="
 set /p "acemail=Enter email address to set active: "
+if not defined acemail goto manage_account
+:: Sanitize metacharacters and quotes to prevent command injection
+set "acemail=%acemail:&=%"
+set "acemail=%acemail:|=%"
+set "acemail=%acemail:<=%"
+set "acemail=%acemail:>=%"
+set "acemail=%acemail:^=%"
+set "acemail=%acemail:"=%"
 if not "%acemail%"=="" if defined CLI_BIN (
-    "%CLI_BIN%" %CFG_ARG% creds set %acemail%
+    "%CLI_BIN%" %CFG_ARG% creds set "%acemail%"
 )
 pause
 goto manage_account

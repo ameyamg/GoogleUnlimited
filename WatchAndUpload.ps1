@@ -62,11 +62,54 @@ if (-not $script:GOTOHP) {
     }
 }
 
+function Assert-BinaryIntegrity([string]$binPath) {
+    if (-not [System.IO.File]::Exists($binPath)) { return }
+    $trustedHashes = @{
+        "gotohp-cli-x64.exe"         = "c272a285a03aeea02a909f0b74d36f84c4a29c235c8dee47f7de75c83f15d2b1"
+        "gotohp-x64.exe"             = "5c3f757b9e6b2ffd83934b59274136cf4e67c000265e2eaaa4f34dca6a821088"
+        "gotohp-cli_amd64"           = "945021d5dbc36a96f53121eb4f907ace39d9457cea1b43107ed1986441b29030"
+        "gotohp-cli-macos-universal" = "d697e23c648881cf5e7db7b93f815f6d3dcbd9d7718a40d0edffee90456b0557"
+    }
+    $binName = [System.IO.Path]::GetFileName($binPath).ToLower()
+    if ($trustedHashes.ContainsKey($binName)) {
+        $expected = $trustedHashes[$binName]
+        $actual = (Get-FileHash -LiteralPath $binPath -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $expected) {
+            Write-Host "CRITICAL: Binary integrity verification failed for $binName!" -ForegroundColor Red
+            Write-Host "  Expected SHA-256: $expected" -ForegroundColor Red
+            Write-Host "  Actual SHA-256:   $actual" -ForegroundColor Red
+            throw "Binary integrity verification failed for $binName. Possible file tampering or corruption."
+        }
+    }
+}
+
+if ($script:GOTOHP) {
+    Assert-BinaryIntegrity $script:GOTOHP
+}
+
+function Protect-FileAcl([string]$filePath) {
+    if (-not [System.IO.File]::Exists($filePath)) { return }
+    try {
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+        $acl.SetAccessRuleProtection($true, $false) # Disable inheritance, purge inherited permissions
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $acl.AddAccessRule($rule)
+        Set-Acl -LiteralPath $filePath -AclObject $acl
+    } catch {
+        # Gracefully handle filesystems without Windows ACL support (e.g. FAT32/exFAT)
+    }
+}
+
 # Discover portable configuration
 $script:CONFIG_ARGS = @()
 $portableConfig = Join-Path $script:BASE "gotohp.config"
 if ([System.IO.File]::Exists($portableConfig)) {
     $script:CONFIG_ARGS = @("--config", $portableConfig)
+    Protect-FileAcl $portableConfig
 }
 
 # ---------------------------------------------------------------------
@@ -134,16 +177,19 @@ if ($EnableStartup) {
     }
 
     Write-Host "Setting up Google Photos Auto-Sync to run on Windows startup..." -ForegroundColor Cyan
-    $vbsPath = Join-Path $script:BASE "StartPhotosWatcher.vbs"
-    if (-not [System.IO.File]::Exists($vbsPath)) {
-        Write-Host "[ERROR] Could not find $vbsPath" -ForegroundColor Red
+    $scriptFile = Join-Path $script:BASE "WatchAndUpload.ps1"
+    if (-not [System.IO.File]::Exists($scriptFile)) {
+        Write-Host "[ERROR] Could not find $scriptFile" -ForegroundColor Red
         return
     }
+
+    $psExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { (Get-Command pwsh).Source } else { "powershell.exe" }
 
     try {
         $ws = New-Object -ComObject WScript.Shell
         $s = $ws.CreateShortcut($shortcutPath)
-        $s.TargetPath = $vbsPath
+        $s.TargetPath = $psExe
+        $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptFile`""
         $s.WorkingDirectory = $script:BASE
         $s.Description = "Google Photos Unlimited Auto-Sync Watcher"
         $s.Save()
@@ -602,13 +648,15 @@ try {
     )
     foreach ($e in $extList) { $script:EXT.Add($e) | Out-Null }
 
-    # In-memory caches for O(1) lookups
-    $script:history    = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $script:fileLookup = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $script:pathSize   = New-Object 'System.Collections.Generic.Dictionary[string,long]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $script:pathHash   = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $script:retryMap   = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $script:inFlight   = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    # Bounded in-memory LRU cache (capped at 5,000 items to prevent unbounded memory growth)
+    $script:MAX_CACHE_SIZE = 5000
+    $script:history        = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $script:cacheQueue     = New-Object 'System.Collections.Generic.Queue[string]'
+    $script:fileLookup     = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $script:pathSize       = New-Object 'System.Collections.Generic.Dictionary[string,long]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $script:pathHash       = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $script:retryMap       = New-Object 'System.Collections.Generic.Dictionary[string,int]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $script:inFlight       = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     # Mutex for thread-safe cross-process SQLite database access
     $cleanPath = $script:DB.ToLower().Replace("\", "_").Replace(":", "").Replace(" ", "_")
@@ -818,6 +866,17 @@ public static class Win32IoHelper {
     }
 
     function Initialize-DB {
+        # Security: Enforce restrictive user-only ACLs on database and journals (SEC-03)
+        if (-not [System.IO.File]::Exists($script:DB)) {
+            try { [System.IO.File]::WriteAllBytes($script:DB, @()) } catch {}
+        }
+        Protect-FileAcl $script:DB
+        Protect-FileAcl ($script:DB + "-wal")
+        Protect-FileAcl ($script:DB + "-shm")
+        if ([System.IO.File]::Exists($portableConfig)) {
+            Protect-FileAcl $portableConfig
+        }
+
         $ddl = @"
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -890,28 +949,69 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         }
     }
 
+    function Add-ToCache([string]$path, [long]$fileSize = 0, [string]$contentHash = "", [string]$fileName = "") {
+        if (-not $path) { return }
+        if (-not $fileName) {
+            $fileName = [System.IO.Path]::GetFileName($path)
+        }
+
+        if (-not $script:history.Contains($path)) {
+            while ($script:cacheQueue.Count -ge $script:MAX_CACHE_SIZE) {
+                $evicted = $script:cacheQueue.Dequeue()
+                if ($evicted) {
+                    $null = $script:history.Remove($evicted)
+                    $null = $script:pathSize.Remove($evicted)
+                    $null = $script:pathHash.Remove($evicted)
+                }
+            }
+            $script:history.Add($path) | Out-Null
+            $script:cacheQueue.Enqueue($path)
+        }
+
+        if ($fileSize -gt 0) {
+            $script:pathSize[$path] = $fileSize
+        }
+        if ($contentHash) {
+            $script:pathHash[$path] = $contentHash
+        }
+        if ($fileName -and $fileSize -gt 0) {
+            if ($script:fileLookup.Count -ge ($script:MAX_CACHE_SIZE * 2)) {
+                $script:fileLookup.Clear()
+            }
+            $script:fileLookup.Add("$fileName|$fileSize") | Out-Null
+        }
+    }
+
     function Load-Cache {
-        $rows = Invoke-SqliteQuery -DataSource $script:DB -Query "SELECT path, file_name, file_size, content_hash FROM uploads"
+        $totalCountRow = Invoke-SqliteQuery -DataSource $script:DB -Query "SELECT COUNT(*) AS c FROM uploads" -ErrorAction SilentlyContinue
+        $totalCount = if ($totalCountRow -and $totalCountRow.c) { [int]$totalCountRow.c } else { 0 }
+
+        # Preload the most recent items into LRU cache (bounded by MAX_CACHE_SIZE)
+        $rows = Invoke-SqliteQuery -DataSource $script:DB `
+            -Query "SELECT path, file_name, file_size, content_hash FROM uploads ORDER BY uploaded_at DESC LIMIT $($script:MAX_CACHE_SIZE)"
         foreach ($r in $rows) {
             if ($r.path) {
-                $script:history.Add($r.path) | Out-Null
-                if ($r.file_size) {
-                    $script:pathSize[$r.path] = [long]$r.file_size
-                }
-                if ($r.content_hash) {
-                    $script:pathHash[$r.path] = [string]$r.content_hash
-                }
-            }
-            if ($r.file_name -and $r.file_size) {
-                $script:fileLookup.Add("$($r.file_name)|$($r.file_size)") | Out-Null
+                $fSize = if ($r.file_size) { [long]$r.file_size } else { 0 }
+                $fHash = if ($r.content_hash) { [string]$r.content_hash } else { "" }
+                $fName = if ($r.file_name) { [string]$r.file_name } else { "" }
+                Add-ToCache -path $r.path -fileSize $fSize -contentHash $fHash -fileName $fName
             }
         }
-        Write-Log "Cache loaded: $($script:history.Count) uploaded files."
+        Write-Log "Cache loaded: $($script:history.Count) recent uploaded files ($totalCount total in database)."
 
         $retries = Invoke-SqliteQuery -DataSource $script:DB -Query "SELECT path, attempts FROM retry_queue"
         foreach ($r in $retries) {
-            if ($r.path -and -not $script:history.Contains($r.path)) {
-                $script:retryMap[$r.path] = [int]$r.attempts
+            if ($r.path) {
+                $alreadyUploaded = $script:history.Contains($r.path)
+                if (-not $alreadyUploaded) {
+                    $dbCheck = Invoke-SqliteQuery -DataSource $script:DB `
+                        -Query "SELECT 1 FROM uploads WHERE path = @p LIMIT 1" `
+                        -SqlParameters @{ p = $r.path } -ErrorAction SilentlyContinue
+                    if ($dbCheck) { $alreadyUploaded = $true }
+                }
+                if (-not $alreadyUploaded) {
+                    $script:retryMap[$r.path] = [int]$r.attempts
+                }
             }
         }
         if ($script:retryMap.Count -gt 0) {
@@ -955,16 +1055,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         }
 
         if ($saved) {
-            $script:history.Add($path) | Out-Null
-            if ($fileSize -gt 0) {
-                $script:pathSize[$path] = $fileSize
-            }
-            if ($contentHash) {
-                $script:pathHash[$path] = $contentHash
-            }
-            if ($fileName -and $fileSize -gt 0) {
-                $script:fileLookup.Add("$fileName|$fileSize") | Out-Null
-            }
+            Add-ToCache -path $path -fileSize $fileSize -contentHash $contentHash -fileName $fileName
             $null = $script:retryMap.Remove($path)
             return $true
         } else {
@@ -1052,12 +1143,15 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
     }
 
     function Test-IsDuplicateUpload([string]$filePath) {
+        # 1. Fast in-memory LRU cache check
         if ($script:history.Contains($filePath)) {
             $fiCheck = New-Object System.IO.FileInfo($filePath)
             if ($fiCheck.Exists) {
                 if ($script:pathSize.ContainsKey($filePath) -and $script:pathSize[$filePath] -gt 0) {
                     if ($script:pathSize[$filePath] -ne $fiCheck.Length) {
                         $null = $script:history.Remove($filePath)
+                        $null = $script:pathSize.Remove($filePath)
+                        $null = $script:pathHash.Remove($filePath)
                         return $false
                     }
                 }
@@ -1065,6 +1159,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                     $curHash = Get-FileHashSafe $filePath
                     if ($curHash -and $curHash -ne $script:pathHash[$filePath]) {
                         $null = $script:history.Remove($filePath)
+                        $null = $script:pathSize.Remove($filePath)
+                        $null = $script:pathHash.Remove($filePath)
                         return $false
                     }
                 }
@@ -1076,9 +1172,44 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         if (-not $fi.Exists) { return $false }
         $name = $fi.Name
         $len = $fi.Length
-        $lookupKey = "$name|$len"
 
-        if (-not $script:fileLookup.Contains($lookupKey)) {
+        # 2. Database check for exact path (indexed PRIMARY KEY lookup on cache miss)
+        $exactDb = Invoke-SqliteQuery -DataSource $script:DB `
+            -Query "SELECT file_size, content_hash FROM uploads WHERE path = @p LIMIT 1" `
+            -SqlParameters @{ p = $filePath } -ErrorAction SilentlyContinue
+
+        if ($exactDb) {
+            $prevSize = if ($exactDb.file_size) { [long]$exactDb.file_size } else { 0 }
+            $prevHash = if ($exactDb.content_hash) { [string]$exactDb.content_hash } else { "" }
+
+            if ($prevSize -gt 0 -and $len -gt 0 -and $prevSize -ne $len) {
+                return $false
+            }
+            if ($prevHash) {
+                $curHash = Get-FileHashSafe $filePath
+                if ($curHash -and $curHash -ne $prevHash) {
+                    return $false
+                }
+            }
+            # Cache the verified path in LRU cache so subsequent sweeps hit memory
+            Add-ToCache -path $filePath -fileSize $len -contentHash $prevHash -fileName $name
+            return $true
+        }
+
+        # 3. Dual-boot cross-platform deduplication check (matching name and size)
+        $lookupKey = "$name|$len"
+        $mightBeDuplicate = $script:fileLookup.Contains($lookupKey)
+        if (-not $mightBeDuplicate) {
+            # Check DB index idx_uploads_file on cache miss
+            $dbNameCheck = Invoke-SqliteQuery -DataSource $script:DB `
+                -Query "SELECT 1 FROM uploads WHERE file_name = @fn AND file_size = @fs AND file_size > 0 LIMIT 1" `
+                -SqlParameters @{ fn = $name; fs = $len } -ErrorAction SilentlyContinue
+            if ($dbNameCheck) {
+                $mightBeDuplicate = $true
+            }
+        }
+
+        if (-not $mightBeDuplicate) {
             return $false
         }
 
@@ -1111,6 +1242,11 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
     function Test-IsEligibleMedia([System.IO.FileInfo]$fi) {
         if (-not $script:EXT.Contains($fi.Extension.ToLower())) { return $false }
         if ($fi.FullName.Contains("\Modules\")) { return $false }
+        # Security: Skip symbolic links, reparse points, and junction directories (SEC-05)
+        if ($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
+        try {
+            if ($fi.Directory -and ($fi.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+        } catch {}
         if ($script:inFlight.Contains($fi.FullName)) { return $false }
         if (-not $ForceResync -and (Test-IsDuplicateUpload $fi.FullName)) { return $false }
         return $true
@@ -1125,6 +1261,11 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         $name = [System.IO.Path]::GetFileName($path)
         $fileInfo = New-Object System.IO.FileInfo($path)
         if (-not $fileInfo.Exists) { return }
+        # Security: Skip symbolic links, reparse points, and junction directories (SEC-05)
+        if ($fileInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+        try {
+            if ($fileInfo.Directory -and ($fileInfo.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return }
+        } catch {}
 
         if (-not $script:inFlight.Add($path)) { return }
 
@@ -1201,7 +1342,15 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
             $unitName = if ($isMB) { "MB" } else { "KB" }
             $totalFormatted = [Math]::Round($fileBytes / $unitDiv, 1).ToString("0.0")
 
-            $estSpeed = if ($script:lastUploadSpeed -and $script:lastUploadSpeed -gt 0) { $script:lastUploadSpeed } else { 5MB }
+            # Scale baseline speed estimation: multi-GB files estimate using realistic sustained home upload speed (e.g. 2 MB/s ~ 16 Mbps)
+            # to prevent the simulated progress bar from racing to 50% and stalling
+            $estSpeed = if ($fileBytes -gt 1GB) {
+                2MB
+            } elseif ($script:lastUploadSpeed -and $script:lastUploadSpeed -gt 0) {
+                $script:lastUploadSpeed
+            } else {
+                3MB
+            }
             $estTotalSec = [Math]::Max(3.0, $fileBytes / $estSpeed)
 
             try {
@@ -1244,6 +1393,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                 }
             } finally {
                 $script:currentUploadProc = $null
+                if ([System.IO.File]::Exists($portableConfig)) {
+                    Protect-FileAcl $portableConfig
+                }
             }
 
             $stdout = ""
@@ -1408,7 +1560,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         }
         Write-Host ""
         
-        $totalCount = $script:history.Count
+        $totalCountRow = Invoke-SqliteQuery -DataSource $script:DB -Query "SELECT COUNT(*) AS c FROM uploads" -ErrorAction SilentlyContinue
+        $totalCount = if ($totalCountRow -and $totalCountRow.c) { [int]$totalCountRow.c } else { $script:history.Count }
         $retCount   = $script:retryMap.Count
         Write-Host "  Total Uploaded Files : $totalCount" -ForegroundColor Yellow
         Write-Host "  Pending Retries      : $retCount"   -ForegroundColor $(if ($retCount -gt 0) { "Red" } else { "Green" })
@@ -1487,6 +1640,10 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
     foreach ($dir in $script:WATCH_DIRS) {
         try {
             Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object {
+                    -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
+                    -not ($_.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+                } |
                 Where-Object { Test-IsEligibleMedia $_ } |
                 ForEach-Object { $unrecorded.Add($_) }
         } catch {
@@ -1612,7 +1769,17 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         if (($now - $lastRetryFlush).TotalSeconds -ge 30) {
             $lastRetryFlush = $now
             foreach ($qf in @($script:retryMap.Keys)) {
-                if ($script:history.Contains($qf)) {
+                $alreadyUploaded = $script:history.Contains($qf)
+                if (-not $alreadyUploaded) {
+                    $dbCheck = Invoke-SqliteQuery -DataSource $script:DB `
+                        -Query "SELECT 1 FROM uploads WHERE path = @p LIMIT 1" `
+                        -SqlParameters @{ p = $qf } -ErrorAction SilentlyContinue
+                    if ($dbCheck) {
+                        $alreadyUploaded = $true
+                        Add-ToCache -path $qf
+                    }
+                }
+                if ($alreadyUploaded) {
                     Remove-Retry $qf
                     continue
                 }
@@ -1632,6 +1799,10 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
             foreach ($dir in $script:WATCH_DIRS) {
                 try {
                     Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object {
+                            -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
+                            -not ($_.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+                        } |
                         Where-Object { Test-IsEligibleMedia $_ } |
                         ForEach-Object {
                             Write-Log "Sweep detected new file: $($_.Name)" "INFO"

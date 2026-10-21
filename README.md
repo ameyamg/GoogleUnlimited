@@ -32,6 +32,7 @@
   - [Single-Instance Protection](#single-instance-protection)
 - [Data Storage, Privacy, and Security](#data-storage-privacy-and-security)
 - [Troubleshooting](#troubleshooting)
+  - [Video Streaming, Seeking, & Android TV Playback](#7-video-streaming-seeking-and-android-tv-playback)
 - [Limitations and Disclaimer](#limitations-and-disclaimer)
 - [Credits and License](#credits-and-license)
 
@@ -525,6 +526,18 @@ CREATE TABLE logs (
   - **Windows**: `GoogleUnlimited.bat logs` (or menu option `[4]`).
   - **macOS / Linux**: `./google-unlimited.sh logs` (or menu option `[3]`).
 - *Note: Do not delete `gphotos.db` to troubleshoot minor issues. Deleting `gphotos.db` resets your local upload history and will cause GoogleUnlimited to re-evaluate and re-upload all existing media.*
+
+### 7. Video Streaming, Seeking, and Android TV Playback
+- **Symptom**: When streaming backed-up videos to an external player on Android TV (e.g., Kodi, Nova Video Player, VLC), seeking forward/backward fails or resuming a partially watched video starts over from the beginning.
+- **Cause**: GoogleUnlimited is a local backup/synchronization daemon that uploads original media to Google Photos. Google Photos direct/raw download endpoints do not support HTTP `Range:` headers (HTTP 206 Partial Content) for random byte-range seeking on original media files. The built-in Google Photos web/mobile player can seek and resume because Google generates lower-resolution transcoded DASH/HLS streams on their backend (which strips secondary audio tracks, Dolby/DTS audio, and embedded subtitle tracks).
+- **Workarounds**:
+  - **Option A (Rclone WebDAV with VFS Full Cache)**: Serve your Google Photos remote to your local network or Android TV using Rclone with `--vfs-cache-mode full`:
+    ```bash
+    rclone serve webdav gphotos: --vfs-cache-mode full --vfs-read-chunk-size 32M --vfs-read-chunk-size-limit 2G
+    ```
+    Rclone intercepts the video player's byte-range requests and downloads sparse chunks on demand, synthesizing standard HTTP 206 responses locally so seeking and resuming work seamlessly.
+  - **Option B (AList Media Proxy)**: Connect Google Photos as a storage provider in [AList](https://github.com/alist-org/alist) and enable WebDAV streaming with local proxying. AList handles chunked buffering and range requests for players like Nova or Kodi while preserving original media quality and multi-track audio.
+  - **Option C (Player-Side Network Caching)**: In Kodi, configure `advancedsettings.xml` with disk/RAM buffering (`<buffermode>1</buffermode>`), or in Nova Video Player enable **Cache to disk** under video player settings to allow local seek within buffered segments.
 
 ---
 

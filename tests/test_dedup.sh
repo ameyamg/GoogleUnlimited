@@ -39,14 +39,20 @@ compute_hash() {
     fi
 }
 
+escape_sqlite_literal() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
 test_is_uploaded() {
     local fpath="$1"
     local fname
     fname="$(basename "$fpath")"
     local fsize
     fsize="$(stat -c%s "$fpath" 2>/dev/null || stat -f%z "$fpath" 2>/dev/null || echo 0)"
-    local escaped_path="${fpath//\'/\'\'}"
-    local escaped_name="${fname//\'/\'\'}"
+    local escaped_path
+    escaped_path="$(escape_sqlite_literal "$fpath")"
+    local escaped_name
+    escaped_name="$(escape_sqlite_literal "$fname")"
 
     # 1. Exact path (with in-place modification verification)
     local exact_row
@@ -127,8 +133,9 @@ head -c 1024 < /dev/zero | tr '\0' 'A' > "$FILE_A"
 HASH_A="$(compute_hash "$FILE_A")"
 
 # Insert File A into test DB via heredoc
+escaped_file_a="$(escape_sqlite_literal "$FILE_A")"
 sqlite3 "$TEST_DB" <<EOF
-INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('${FILE_A//\'/\'\'}', 'KEY_A', 'photo.jpg', 1024, '$HASH_A');
+INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('$escaped_file_a', 'KEY_A', 'photo.jpg', 1024, '$HASH_A');
 EOF
 
 # 1. Exact path
@@ -169,9 +176,9 @@ FILE_QUOTE="$TEMP_DIR/FolderD/vacation\"photo.jpg"
 mkdir -p "$TEMP_DIR/FolderD"
 head -c 512 < /dev/zero | tr '\0' 'Q' > "$FILE_QUOTE"
 HASH_QUOTE="$(compute_hash "$FILE_QUOTE")"
-escaped_quote_path="${FILE_QUOTE//\'/\'\'}"
+escaped_quote_path="$(escape_sqlite_literal "$FILE_QUOTE")"
 escaped_quote_name="$(basename "$FILE_QUOTE")"
-escaped_quote_name="${escaped_quote_name//\'/\'\'}"
+escaped_quote_name="$(escape_sqlite_literal "$escaped_quote_name")"
 sqlite3 "$TEST_DB" <<EOF
 INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('$escaped_quote_path', 'KEY_Q', '$escaped_quote_name', 512, '$HASH_QUOTE');
 EOF
@@ -183,9 +190,9 @@ FILE_APOS="$TEMP_DIR/FolderE/mom's_photo.jpg"
 mkdir -p "$TEMP_DIR/FolderE"
 head -c 512 < /dev/zero | tr '\0' 'S' > "$FILE_APOS"
 HASH_APOS="$(compute_hash "$FILE_APOS")"
-escaped_apos_path="${FILE_APOS//\'/\'\'}"
+escaped_apos_path="$(escape_sqlite_literal "$FILE_APOS")"
 escaped_apos_name="$(basename "$FILE_APOS")"
-escaped_apos_name="${escaped_apos_name//\'/\'\'}"
+escaped_apos_name="$(escape_sqlite_literal "$escaped_apos_name")"
 sqlite3 "$TEST_DB" <<EOF
 INSERT INTO uploads(path, media_key, file_name, file_size, content_hash) VALUES ('$escaped_apos_path', 'KEY_S', '$escaped_apos_name', 512, '$HASH_APOS');
 EOF

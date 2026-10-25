@@ -13,7 +13,8 @@ $testFiles = @(
     "test_upload_verification.ps1",
     "test_single_instance.ps1",
     "test_permissions.ps1",
-    "test_lru_cache.ps1"
+    "test_lru_cache.ps1",
+    "test_upload_progress.ps1"
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

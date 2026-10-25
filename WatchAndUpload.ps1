@@ -633,7 +633,7 @@ try {
     $script:MIN_BYTES = 10240   # 10 KB minimum file size
     $script:MAX_RETRY = 3       # Max retry attempts per file
     $script:LOG_RETENTION_DAYS = 30
-    $script:lastUploadSpeed = 5MB  # Adaptive baseline for smooth, realistic progress tracking
+    $script:lastUploadSpeed = 2MB  # Adaptive baseline for smooth, realistic progress tracking
     $script:currentUploadProc = $null
 
     # Supported media extensions (photos, camera RAWs, and videos)
@@ -1353,6 +1353,17 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
             }
             $estTotalSec = [Math]::Max(3.0, $fileBytes / $estSpeed)
 
+            $hasIoHelper = [bool](([System.Management.Automation.PSTypeName]'Win32IoHelper').Type)
+            $initialRead = 0UL
+            if ($hasIoHelper) {
+                try {
+                    $io = New-Object Win32IoHelper+IO_COUNTERS
+                    if (-not $proc.HasExited -and [Win32IoHelper]::GetProcessIoCounters($proc.Handle, [ref]$io)) {
+                        $initialRead = $io.ReadTransferCount
+                    }
+                } catch {}
+            }
+
             try {
                 while (-not $proc.WaitForExit(150)) {
                     $elapsedSec = $sw.Elapsed.TotalSeconds
@@ -1364,10 +1375,33 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                         break
                     }
 
-                    # Maintain steady, linear upload speed progression
-                    $effectiveTotalSec = [Math]::Max($estTotalSec, $elapsedSec * 1.15 + 2.0)
-                    $ratio = [Math]::Min(0.985, [Math]::Max(0.01, $elapsedSec / $effectiveTotalSec))
-                    $uploadedBytes = $fileBytes * $ratio
+                    $uploadedBytes = 0.0
+                    $ratio = 0.0
+
+                    # 1. Primary real-time tracking: Process IO Transfer Counters (Windows NT)
+                    if ($hasIoHelper) {
+                        try {
+                            $io = New-Object Win32IoHelper+IO_COUNTERS
+                            if (-not $proc.HasExited -and [Win32IoHelper]::GetProcessIoCounters($proc.Handle, [ref]$io)) {
+                                $rawDelta = [double]($io.ReadTransferCount - $initialRead)
+                                if ($rawDelta -gt 0 -and $fileBytes -gt 0) {
+                                    $uploadedBytes = [Math]::Min($fileBytes, $rawDelta)
+                                    $ratio = [Math]::Min(0.99, [Math]::Max(0.01, $uploadedBytes / $fileBytes))
+                                }
+                            }
+                        } catch {}
+                    }
+
+                    # 2. Fallback tracking: Adaptive monotonic progression if IO counters unavailable
+                    if ($ratio -le 0.0) {
+                        if ($elapsedSec -lt $estTotalSec) {
+                            $ratio = [Math]::Min(0.90, [Math]::Max(0.01, ($elapsedSec / $estTotalSec) * 0.90))
+                        } else {
+                            $overSec = $elapsedSec - $estTotalSec
+                            $ratio = 0.90 + (0.09 * (1.0 - [Math]::Exp(-$overSec / [Math]::Max(30.0, $estTotalSec))))
+                        }
+                        $uploadedBytes = [Math]::Min($fileBytes * 0.99, $fileBytes * $ratio)
+                    }
 
                     $pct = [Math]::Round($ratio * 100.0, 1)
                     $filled = [int][Math]::Floor($ratio * $barWidth)
@@ -1379,10 +1413,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
 
                     $timeStr = "$([Math]::Round($elapsedSec, 1).ToString('0.0'))s"
                     $etaStr = ""
-                    if ($ratio -gt 0.03 -and $elapsedSec -gt 0.4) {
+                    if ($ratio -ge 0.99) {
+                        $etaStr = ", finalizing..."
+                    } elseif ($ratio -gt 0.03 -and $elapsedSec -gt 0.8) {
                         $speedBytes = $uploadedBytes / $elapsedSec
                         $remainBytes = [Math]::Max(0.0, $fileBytes - $uploadedBytes)
-                        if ($speedBytes -gt 0) {
+                        if ($speedBytes -gt 1024) {
                             $remainSec = $remainBytes / $speedBytes
                             $etaStr = ", " + (Format-RemainingTime $remainSec)
                         }
@@ -1433,7 +1469,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                 $contentHash = Get-FileHashSafe $path
                 if ($totalTime -ge 1.0 -and $fileBytes -ge 1MB) {
                     $speed = $fileBytes / $totalTime
-                    $script:lastUploadSpeed = [Math]::Max(1MB, [Math]::Min(200MB, ($script:lastUploadSpeed * 0.4) + ($speed * 0.6)))
+                    $script:lastUploadSpeed = [Math]::Max(200KB, [Math]::Min(200MB, ($script:lastUploadSpeed * 0.4) + ($speed * 0.6)))
                 }
                 $avgSpeed = if ($totalTime -gt 0 -and $fileBytes -gt 0) {
                     $speed = $fileBytes / $totalTime

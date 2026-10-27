@@ -253,13 +253,20 @@ function Get-StandardWindowsFolders {
     } catch {}
     $downPath = if ($regDown -and [System.IO.Directory]::Exists($regDown)) { $regDown } else { Join-Path $userHome "Downloads" }
 
+    $oneDriveRoot = $env:OneDrive
+    if (-not $oneDriveRoot -and [System.IO.Directory]::Exists((Join-Path $userHome "OneDrive"))) {
+        $oneDriveRoot = Join-Path $userHome "OneDrive"
+    }
+    $oneDrivePic = if ($oneDriveRoot) { Join-Path $oneDriveRoot "Pictures" } else { Join-Path $userHome "OneDrive\Pictures" }
+
     return [ordered]@{
-        "Pictures"  = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyPictures)
-        "Downloads" = $downPath
-        "Desktop"   = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
-        "Videos"    = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyVideos)
-        "Documents" = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
-        "Music"     = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyMusic)
+        "Pictures"         = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyPictures)
+        "Downloads"        = $downPath
+        "OneDrivePictures" = $oneDrivePic
+        "Desktop"          = [Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)
+        "Videos"           = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyVideos)
+        "Documents"        = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+        "Music"            = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyMusic)
     }
 }
 
@@ -290,8 +297,8 @@ function Get-ConfiguredFoldersList {
         if ($stdFolders["Downloads"] -and [System.IO.Directory]::Exists($stdFolders["Downloads"])) {
             if (-not $dirs.Contains($stdFolders["Downloads"])) { $dirs.Add($stdFolders["Downloads"]) }
         }
-        $cloudPic = Join-Path $userHome "OneDrive\Pictures"
-        if ([System.IO.Directory]::Exists($cloudPic) -and -not $dirs.Contains($cloudPic)) { $dirs.Add($cloudPic) }
+        $cloudPic = $stdFolders["OneDrivePictures"]
+        if ($cloudPic -and [System.IO.Directory]::Exists($cloudPic) -and -not $dirs.Contains($cloudPic)) { $dirs.Add($cloudPic) }
         $iCloud = Join-Path $userHome "Pictures\iCloud Photos\Photos"
         if ([System.IO.Directory]::Exists($iCloud) -and -not $dirs.Contains($iCloud)) { $dirs.Add($iCloud) }
     }
@@ -400,6 +407,7 @@ if ($ManageDirs) {
                 $tag = "[Custom]"
                 if ($f -eq $stdFolders["Pictures"]) { $tag = "[Default: Pictures]" }
                 elseif ($f -eq $stdFolders["Downloads"]) { $tag = "[Default: Downloads]" }
+                elseif ($f -eq $stdFolders["OneDrivePictures"]) { $tag = "[OneDrive: Pictures]" }
                 elseif ($f -eq $stdFolders["Desktop"]) { $tag = "[Desktop]" }
                 elseif ($f -eq $stdFolders["Videos"]) { $tag = "[Videos]" }
                 elseif ($f -eq $stdFolders["Documents"]) { $tag = "[Documents]" }
@@ -419,6 +427,8 @@ if ($ManageDirs) {
         Write-Host "Quick-Toggle Standard Windows Folders:" -ForegroundColor Cyan
         $picActive  = $current.Contains($stdFolders["Pictures"])
         $downActive = $current.Contains($stdFolders["Downloads"])
+        $onePicPath = $stdFolders["OneDrivePictures"]
+        $oneActive  = if ($onePicPath) { $current.Contains($onePicPath) } else { $false }
         $vidActive  = $current.Contains($stdFolders["Videos"])
         $deskActive = $current.Contains($stdFolders["Desktop"])
         $docActive  = $current.Contains($stdFolders["Documents"])
@@ -429,6 +439,11 @@ if ($ManageDirs) {
 
         Write-Host "  [W] Downloads : $($stdFolders['Downloads']) " -NoNewline
         Write-Host $(if ($downActive) { "[ON  - Press W to Remove]" } else { "[OFF - Press W to Add]" }) -ForegroundColor $(if ($downActive) { "Green" } else { "DarkGray" })
+
+        if ($onePicPath -and [System.IO.Directory]::Exists($onePicPath)) {
+            Write-Host "  [O] OneDrive  : $onePicPath " -NoNewline
+            Write-Host $(if ($oneActive) { "[ON  - Press O to Remove]" } else { "[OFF - Press O to Add]" }) -ForegroundColor $(if ($oneActive) { "Green" } else { "DarkGray" })
+        }
 
         Write-Host "  [V] Videos    : $($stdFolders['Videos']) " -NoNewline
         Write-Host $(if ($vidActive) { "[ON  - Press V to Remove]" } else { "[OFF - Press V to Add]" }) -ForegroundColor $(if ($vidActive) { "Green" } else { "DarkGray" })
@@ -537,6 +552,15 @@ if ($ManageDirs) {
                 if ($d) {
                     if ($current.Contains($d)) { $null = $current.Remove($d); Write-Host "[OK] Removed Downloads" -ForegroundColor Yellow }
                     else { $current.Add($d); Write-Host "[OK] Added Downloads" -ForegroundColor Green }
+                    Save-ConfiguredFoldersList $current
+                    Start-Sleep -Milliseconds 600
+                }
+            }
+            "O" {
+                $o = $stdFolders["OneDrivePictures"]
+                if ($o) {
+                    if ($current.Contains($o)) { $null = $current.Remove($o); Write-Host "[OK] Removed OneDrive Pictures" -ForegroundColor Yellow }
+                    else { $current.Add($o); Write-Host "[OK] Added OneDrive Pictures" -ForegroundColor Green }
                     Save-ConfiguredFoldersList $current
                     Start-Sleep -Milliseconds 600
                 }
@@ -1130,10 +1154,20 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                     $fs.Dispose()
                     return "READY"
                 } catch {
-                    $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
-                    $fs.Close()
-                    $fs.Dispose()
-                    return "READY"
+                    try {
+                        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+                        $fs.Close()
+                        $fs.Dispose()
+                        return "READY"
+                    } catch {
+                        try {
+                            # Fallback for cloud-synced files (OneDrive, iCloud) where sync engine holds shared read lock
+                            $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                            $fs.Close()
+                            $fs.Dispose()
+                            return "READY"
+                        } catch {}
+                    }
                 }
             } catch {
                 Start-Sleep -Seconds 2
@@ -1239,13 +1273,45 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         return $false
     }
 
+    function Test-IsSymlinkOrJunction($item) {
+        if (-not $item) { return $false }
+        try {
+            if ($item -is [string]) {
+                if ([System.IO.Directory]::Exists($item)) {
+                    $item = New-Object System.IO.DirectoryInfo($item)
+                } elseif ([System.IO.File]::Exists($item)) {
+                    $item = New-Object System.IO.FileInfo($item)
+                } else {
+                    return $false
+                }
+            }
+            if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                return $false
+            }
+            # Reparse point is present: distinguish true links (Symlink, Junction, MountPoint) from Cloud Sync Reparse Points (OneDrive, iCloud, etc.)
+            $lt = $item.LinkType
+            if ($lt -and ($lt -eq "SymbolicLink" -or $lt -eq "Junction" -or $lt -eq "MountPoint")) {
+                return $true
+            }
+            if ($item.PSObject.Properties["LinkTarget"] -and -not [string]::IsNullOrEmpty($item.LinkTarget)) {
+                return $true
+            }
+            if ($item.PSObject.Properties["Target"] -and $item.Target) {
+                return $true
+            }
+            return $false
+        } catch {
+            return $false
+        }
+    }
+
     function Test-IsEligibleMedia([System.IO.FileInfo]$fi) {
         if (-not $script:EXT.Contains($fi.Extension.ToLower())) { return $false }
         if ($fi.FullName.Contains("\Modules\")) { return $false }
-        # Security: Skip symbolic links, reparse points, and junction directories (SEC-05)
-        if ($fi.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
+        # Security: Skip symbolic links and junction directories (SEC-05), allow cloud sync files (OneDrive, iCloud)
+        if (Test-IsSymlinkOrJunction $fi) { return $false }
         try {
-            if ($fi.Directory -and ($fi.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
+            if ($fi.Directory -and (Test-IsSymlinkOrJunction $fi.Directory)) { return $false }
         } catch {}
         if ($script:inFlight.Contains($fi.FullName)) { return $false }
         if (-not $ForceResync -and (Test-IsDuplicateUpload $fi.FullName)) { return $false }
@@ -1261,10 +1327,10 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         $name = [System.IO.Path]::GetFileName($path)
         $fileInfo = New-Object System.IO.FileInfo($path)
         if (-not $fileInfo.Exists) { return }
-        # Security: Skip symbolic links, reparse points, and junction directories (SEC-05)
-        if ($fileInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+        # Security: Skip symbolic links and junction directories (SEC-05), allow cloud sync files (OneDrive, iCloud)
+        if (Test-IsSymlinkOrJunction $fileInfo) { return }
         try {
-            if ($fileInfo.Directory -and ($fileInfo.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return }
+            if ($fileInfo.Directory -and (Test-IsSymlinkOrJunction $fileInfo.Directory)) { return }
         } catch {}
 
         if (-not $script:inFlight.Add($path)) { return }
@@ -1677,8 +1743,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
         try {
             Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue |
                 Where-Object {
-                    -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
-                    -not ($_.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+                    -not (Test-IsSymlinkOrJunction $_) -and
+                    (-not $_.Directory -or -not (Test-IsSymlinkOrJunction $_.Directory))
                 } |
                 Where-Object { Test-IsEligibleMedia $_ } |
                 ForEach-Object { $unrecorded.Add($_) }
@@ -1836,8 +1902,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
                 try {
                     Get-ChildItem -LiteralPath $dir -File -Recurse -ErrorAction SilentlyContinue |
                         Where-Object {
-                            -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
-                            -not ($_.Directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+                            -not (Test-IsSymlinkOrJunction $_) -and
+                            (-not $_.Directory -or -not (Test-IsSymlinkOrJunction $_.Directory))
                         } |
                         Where-Object { Test-IsEligibleMedia $_ } |
                         ForEach-Object {

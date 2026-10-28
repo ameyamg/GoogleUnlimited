@@ -22,6 +22,11 @@ RED='\033[0;31m'
 GRAY='\033[0;90m'
 NC='\033[0m'
 
+# Upload progress and adaptive speed tracking (BUG-05)
+LAST_UPLOAD_SPEED=0
+CURRENT_UPLOAD_PID=""
+CURRENT_UPLOAD_TMP=""
+
 # Supported media extensions regex
 MEDIA_EXT_REGEX='^(jpg|jpeg|png|heic|heif|webp|gif|bmp|tiff|tif|svg|ico|jfif|avif|dng|raw|cr2|cr3|nef|arw|orf|rw2|pef|srw|raf|mp4|mov|mkv|avi|m4v|3gp|3g2|wmv|webm|mpg|mpeg|mts|m2ts|ts|flv|vob)$'
 
@@ -70,6 +75,91 @@ expand_watch_path() {
     done
 
     printf '%s\n' "$expanded"
+}
+
+# ---------------------------------------------------------------------
+# UPLOAD PROGRESS TRACKING & FORMATTING (BUG-05)
+# ---------------------------------------------------------------------
+format_remaining_time() {
+    local sec="$1"
+    local s
+    s=$(awk -v sec="$sec" 'BEGIN { printf "%d", sec + 0.5 }')
+    if [ "$s" -ge 3600 ]; then
+        local h=$((s / 3600))
+        local m=$(((s % 3600) / 60))
+        printf "~%dh %dm left" "$h" "$m"
+    elif [ "$s" -ge 60 ]; then
+        local m=$((s / 60))
+        local rem_s=$((s % 60))
+        printf "~%dm %ds left" "$m" "$rem_s"
+    elif [ "$s" -gt 0 ]; then
+        printf "~%ds left" "$s"
+    else
+        printf "finishing..."
+    fi
+}
+
+calculate_fallback_ratio() {
+    local elapsed="$1"
+    local est_total="$2"
+    awk -v elapsed="$elapsed" -v est_total="$est_total" 'BEGIN {
+        if (elapsed < est_total) {
+            r = (elapsed / est_total) * 0.90;
+            if (r < 0.01) r = 0.01;
+            if (r > 0.90) r = 0.90;
+            printf "%.6f", r;
+        } else {
+            over = elapsed - est_total;
+            denom = est_total > 30.0 ? est_total : 30.0;
+            r = 0.90 + (0.09 * (1.0 - exp(-over / denom)));
+            printf "%.6f", r;
+        }
+    }'
+}
+
+render_progress_bar() {
+    local ratio="$1"
+    local bar_width="${2:-14}"
+    awk -v r="$ratio" -v w="$bar_width" 'BEGIN {
+        filled = int(r * w);
+        if (filled < 0) filled = 0;
+        if (filled > w) filled = w;
+        empty = w - filled;
+        bar = "";
+        for (i = 0; i < filled; i++) bar = bar "#";
+        for (i = 0; i < empty; i++) bar = bar "-";
+        print bar;
+    }'
+}
+
+get_process_io_read() {
+    local pid="$1"
+    local pids=("$pid")
+    local children
+    children=$(pgrep -P "$pid" 2>/dev/null || true)
+    if [ -n "$children" ]; then
+        for c in $children; do
+            pids+=("$c")
+        done
+    fi
+
+    local total=0
+    for p in "${pids[@]}"; do
+        if [ -r "/proc/$p/io" ]; then
+            local r
+            r=$(awk '/^read_bytes:/ {print $2}' "/proc/$p/io" 2>/dev/null || true)
+            if [ -n "$r" ] && [ "$r" -gt 0 ]; then
+                total=$((total + r))
+            else
+                local rc
+                rc=$(awk '/^rchar:/ {print $2}' "/proc/$p/io" 2>/dev/null || true)
+                if [ -n "$rc" ] && [ "$rc" -gt 0 ]; then
+                    total=$((total + rc))
+                fi
+            fi
+        fi
+    done
+    echo "$total"
 }
 
 # ---------------------------------------------------------------------
@@ -1037,14 +1127,140 @@ EOF
         return
     fi
 
+    # Prepare units and baseline estimation
+    local bar_width=14
+    local is_mb=1
+    local unit_name="MB"
+    local unit_div=1048576
+    if [ "$size_bytes" -lt 1048576 ]; then
+        is_mb=0
+        unit_name="KB"
+        unit_div=1024
+    fi
+    local total_formatted
+    total_formatted=$(awk -v b="$size_bytes" -v d="$unit_div" 'BEGIN { printf "%.1f", b / d }')
+
+    local timeout_seconds=$(( size_bytes / 51200 ))
+    [ "$timeout_seconds" -lt 600 ] && timeout_seconds=600
+
+    local est_speed
+    if [ "$size_bytes" -gt 1073741824 ]; then
+        est_speed=2097152
+    elif [ "${LAST_UPLOAD_SPEED:-0}" -gt 0 ]; then
+        est_speed="$LAST_UPLOAD_SPEED"
+    else
+        est_speed=3145728
+    fi
+
+    local est_total_sec
+    est_total_sec=$(awk -v b="$size_bytes" -v s="$est_speed" 'BEGIN { t = b / s; if (t < 3.0) t = 3.0; printf "%.1f", t }')
+
+    local out_tmp
+    out_tmp="$(mktemp "${TMPDIR:-/tmp}/gotohp_up_XXXXXX.log")"
+    chmod 600 "$out_tmp" 2>/dev/null || true
+    CURRENT_UPLOAD_TMP="$out_tmp"
+
     local start_time
     start_time=$(date +%s)
-    local output
-    output="$(run_gotohp upload --no-tui "$fpath" 2>&1)"
+
+    run_gotohp upload --no-tui "$fpath" > "$out_tmp" 2>&1 &
+    local upload_pid=$!
+    CURRENT_UPLOAD_PID="$upload_pid"
+
+    local initial_read
+    initial_read=$(get_process_io_read "$upload_pid")
+    local timed_out=0
+
+    while kill -0 "$upload_pid" 2>/dev/null; do
+        local now
+        now=$(date +%s)
+        local elapsed=$((now - start_time))
+        if [ "$elapsed" -ge "$timeout_seconds" ]; then
+            timed_out=1
+            pkill -P "$upload_pid" 2>/dev/null || true
+            kill -9 "$upload_pid" 2>/dev/null || true
+            break
+        fi
+
+        local ratio=0.0
+        local uploaded_bytes=0
+
+        # 1. Primary real-time tracking: Process IO Transfer Counters
+        local current_read
+        current_read=$(get_process_io_read "$upload_pid")
+        local raw_delta=$((current_read - initial_read))
+        if [ "$raw_delta" -gt 0 ] && [ "$size_bytes" -gt 0 ]; then
+            uploaded_bytes=$(( raw_delta > size_bytes ? size_bytes : raw_delta ))
+            ratio=$(awk -v up="$uploaded_bytes" -v tot="$size_bytes" 'BEGIN {
+                r = up / tot;
+                if (r < 0.01) r = 0.01;
+                if (r > 0.99) r = 0.99;
+                printf "%.6f", r;
+            }')
+        fi
+
+        # 2. Fallback tracking: Adaptive monotonic progression if IO counters unavailable
+        local c_zero
+        c_zero=$(awk -v r="$ratio" 'BEGIN { print (r <= 0.0) ? 1 : 0 }')
+        if [ "$c_zero" -eq 1 ]; then
+            ratio=$(calculate_fallback_ratio "$elapsed" "$est_total_sec")
+            uploaded_bytes=$(awk -v tot="$size_bytes" -v r="$ratio" 'BEGIN { printf "%.0f", tot * r }')
+        fi
+
+        local bar
+        bar=$(render_progress_bar "$ratio" "$bar_width")
+        local pct
+        pct=$(awk -v r="$ratio" 'BEGIN { printf "%5.1f", r * 100 }')
+        local curr_formatted
+        curr_formatted=$(awk -v up="$uploaded_bytes" -v d="$unit_div" 'BEGIN { printf "%.1f", up / d }')
+
+        local eta_str=""
+        local c_fin
+        c_fin=$(awk -v r="$ratio" 'BEGIN { print (r >= 0.99) ? 1 : 0 }')
+        if [ "$c_fin" -eq 1 ]; then
+            eta_str=", finalizing..."
+        else
+            local c_act
+            c_act=$(awk -v r="$ratio" -v el="$elapsed" 'BEGIN { print (r > 0.03 && el > 0) ? 1 : 0 }')
+            if [ "$c_act" -eq 1 ]; then
+                local remain_bytes=$(( size_bytes - uploaded_bytes ))
+                [ "$remain_bytes" -lt 0 ] && remain_bytes=0
+                local speed_bytes
+                speed_bytes=$(awk -v up="$uploaded_bytes" -v el="$elapsed" 'BEGIN { printf "%.0f", up / el }')
+                if [ "$speed_bytes" -gt 1024 ]; then
+                    local remain_sec
+                    remain_sec=$(awk -v rem="$remain_bytes" -v spd="$speed_bytes" 'BEGIN { printf "%.1f", rem / spd }')
+                    eta_str=", $(format_remaining_time "$remain_sec")"
+                fi
+            fi
+        fi
+
+        if [ -t 1 ]; then
+            printf "\r\033[2K  [%s] %s%% | %s / %s %s (%ss%s)" \
+                "$bar" "$pct" "$curr_formatted" "$total_formatted" "$unit_name" "$elapsed" "$eta_str"
+        fi
+
+        sleep 0.2
+    done
+
+    wait "$upload_pid" 2>/dev/null || true
     local exit_code=$?
+    if [ "$timed_out" -eq 1 ]; then
+        exit_code=124
+    fi
+
+    CURRENT_UPLOAD_PID=""
     local end_time
     end_time=$(date +%s)
     local duration=$((end_time - start_time))
+    [ "$duration" -lt 1 ] && duration=1
+
+    local output=""
+    if [ -f "$out_tmp" ]; then
+        output="$(cat "$out_tmp")"
+        rm -f "$out_tmp" 2>/dev/null || true
+    fi
+    CURRENT_UPLOAD_TMP=""
 
     local mkey=""
     mkey="$(echo "$output" | grep -o '"mediaKey": *"[^"]*"' | head -n1 | cut -d'"' -f4 || echo "")"
@@ -1053,18 +1269,65 @@ EOF
     [ -z "$err_msg" ] && err_msg="$(echo "$output" | grep -o '"message": *"[^"]*"' | head -n1 | cut -d'"' -f4 || echo "")"
 
     local is_success=0
-    if [ $exit_code -eq 0 ] && [ -z "$err_msg" ]; then
+    if [ $exit_code -eq 0 ] && [ $timed_out -eq 0 ] && [ -z "$err_msg" ]; then
         if echo "$output" | grep -q '"success": *true' || [ -n "$mkey" ]; then
             is_success=1
         fi
     fi
 
+    local avg_speed=""
+    if [ "$duration" -gt 0 ] && [ "$size_bytes" -gt 0 ]; then
+        avg_speed=$(awk -v t="$duration" -v b="$size_bytes" 'BEGIN {
+            spd = b / t;
+            if (spd >= 1048576) {
+                printf " (%.1f MB/s)", spd / 1048576;
+            } else {
+                printf " (%.1f KB/s)", spd / 1024;
+            }
+        }')
+    fi
+
+    local done_bar=""
+    for ((i = 0; i < bar_width; i++)); do done_bar="${done_bar}#"; done
+    local fail_bar=""
+    for ((i = 0; i < bar_width; i++)); do fail_bar="${fail_bar}-"; done
+
     if [ $is_success -eq 1 ]; then
-        echo "  [####################] 100% [OK] Uploaded in ${duration}s: $fname (${size_mb} MB)"
-        write_log "SUCCESS | $fname (${size_mb} MB in ${duration}s)" "OK"
+        if [ "$duration" -ge 1 ] && [ "$size_bytes" -ge 1048576 ]; then
+            LAST_UPLOAD_SPEED=$(awk -v cur="${LAST_UPLOAD_SPEED:-0}" -v t="$duration" -v b="$size_bytes" 'BEGIN {
+                spd = b / t;
+                if (cur <= 0) cur = 3145728;
+                new_spd = (cur * 0.4) + (spd * 0.6);
+                if (new_spd < 204800) new_spd = 204800;
+                if (new_spd > 209715200) new_spd = 209715200;
+                printf "%.0f", new_spd;
+            }')
+        fi
+
+        if [ -t 1 ]; then
+            printf "\r\033[2K  [%s] 100.0%% [OK] Uploaded in %ss%s: %s (%s %s)\n" \
+                "$done_bar" "$duration" "$avg_speed" "$fname" "$total_formatted" "$unit_name"
+        else
+            echo "  [$done_bar] 100.0% [OK] Uploaded in ${duration}s${avg_speed}: $fname ($total_formatted $unit_name)"
+        fi
+        write_log "SUCCESS | $fname ($total_formatted $unit_name in ${duration}s$avg_speed)" "OK"
         save_upload "$fpath" "$mkey" "$fname" "$size_bytes"
     else
-        echo "  [--------------------] FAILED in ${duration}s: $fname"
+        if [ "$timed_out" -eq 1 ]; then
+            if [ -t 1 ]; then
+                printf "\r\033[2K  [%s] TIMED OUT after %ss: %s\n" "$fail_bar" "$duration" "$fname"
+            else
+                echo "  [$fail_bar] TIMED OUT after ${duration}s: $fname"
+            fi
+            write_log "TIMEOUT | Upload exceeded ${timeout_seconds}s threshold: $fname" "ERROR"
+        else
+            if [ -t 1 ]; then
+                printf "\r\033[2K  [%s] FAILED in %ss: %s\n" "$fail_bar" "$duration" "$fname"
+            else
+                echo "  [$fail_bar] FAILED in ${duration}s: $fname"
+            fi
+        fi
+
         local err_suffix=""
         [ -n "$err_msg" ] && err_suffix=" ($err_msg)"
 
@@ -1252,6 +1515,13 @@ do_watch() {
         if [ -n "${watcher_pid:-}" ]; then
             pkill -P "$watcher_pid" 2>/dev/null || true
             kill "$watcher_pid" 2>/dev/null || true
+        fi
+        if [ -n "${CURRENT_UPLOAD_PID:-}" ]; then
+            pkill -P "$CURRENT_UPLOAD_PID" 2>/dev/null || true
+            kill -9 "$CURRENT_UPLOAD_PID" 2>/dev/null || true
+        fi
+        if [ -n "${CURRENT_UPLOAD_TMP:-}" ] && [ -f "$CURRENT_UPLOAD_TMP" ]; then
+            rm -f "$CURRENT_UPLOAD_TMP" 2>/dev/null || true
         fi
         if [ "$OS" = "Darwin" ]; then
             pkill -f "fswatch.*$SCRIPT_DIR" 2>/dev/null || true
